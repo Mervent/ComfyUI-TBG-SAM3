@@ -265,6 +265,13 @@ class TBGSam3Segmentation:
                     "label_off": "Keep Holes",
                     "tooltip": "When enabled, fills holes inside each mask (solid segments)."
                 }),
+                "dilation": ("INT", {
+                    "default": 0,
+                    "min": -512,
+                    "max": 512,
+                    "step": 1,
+                    "tooltip": "Expand (positive) or shrink (negative) the mask boundary. 0 = no change."
+                }),
 
             },
             "optional": {
@@ -291,9 +298,9 @@ class TBGSam3Segmentation:
 
     def segment(self, sam3_model, image, confidence_threshold=0.2, detect_all=True,
                 pipeline_mode="all", instances=False, crop_factor=1.5, min_size=32,
-                min_density=0.0, fill_holes=False, text_prompt="", sam3_selectors_pipe=None,
-                mask_prompt=None, exemplar_box=None, exemplar_mask=None,
-                max_detections=10):
+                min_density=0.0, fill_holes=False, dilation=0, text_prompt="",
+                sam3_selectors_pipe=None, mask_prompt=None, exemplar_box=None,
+                exemplar_mask=None, max_detections=10):
 
         actual_max_detections = -1 if detect_all else max_detections
 
@@ -657,6 +664,36 @@ class TBGSam3Segmentation:
                 masks = filled_stack.unsqueeze(1)  # [N,1,H,W]
             else:
                 masks = filled_stack  # [N,H,W]
+
+        # --- Optional: dilate or erode each mask ---
+        if dilation != 0 and isinstance(masks, torch.Tensor) and masks.numel() > 0:
+            device = masks.device
+
+            if masks.dim() == 4 and masks.shape[1] == 1:
+                masks_flat = masks[:, 0, :, :].detach().cpu()
+            elif masks.dim() == 3:
+                masks_flat = masks.detach().cpu()
+            elif masks.dim() == 4:
+                masks_flat = masks.mean(dim=1).detach().cpu()
+            else:
+                raise ValueError(f"[SAM3] Unexpected masks shape for dilation: {masks.shape}")
+
+            kernel = np.ones((abs(dilation), abs(dilation)), np.uint8)
+            dilated_list = []
+            for idx in range(masks_flat.shape[0]):
+                m = (masks_flat[idx].numpy() > 0.5).astype(np.uint8)
+                if dilation > 0:
+                    m = cv2.dilate(m, kernel, iterations=1)
+                else:
+                    m = cv2.erode(m, kernel, iterations=1)
+                dilated_list.append(m.astype(np.float32))
+
+            dilated_stack = torch.from_numpy(np.stack(dilated_list, axis=0)).to(device)
+
+            if masks.dim() == 4 and masks.shape[1] == 1:
+                masks = dilated_stack.unsqueeze(1)
+            else:
+                masks = dilated_stack
 
         # --- Build outputs ---
         comfy_masks = masks_to_comfy_mask(masks)
