@@ -6,6 +6,7 @@ All class names and functions prefixed with TBG for uniqueness.
 import torch
 from PIL import Image
 import numpy as np
+import cv2
 
 import json
 import io
@@ -28,7 +29,7 @@ from typing import Tuple, Optional
 
 
 # Impact-Pack style MASK -> SEGS helper (your file in same folder)
-from .masktosegs import mask_to_segs, SEG
+from .masktosegs import mask_to_segs, SEG, make_2d_mask
 
 _MODEL_CACHE = {}
 
@@ -411,8 +412,6 @@ class TBGSam3Segmentation:
 
         # --- Filter out segments smaller than min_size x min_size ---
         if masks is not None and masks.numel() > 0 and min_size > 1:
-            import torch as _torch
-
             # Convert side length to minimum area
             min_area = float(min_size * min_size)
 
@@ -439,7 +438,7 @@ class TBGSam3Segmentation:
             else:
                 print("[SAM3] All detections removed by min_size filter; returning empty result")
                 h, w = pil_image.size[1], pil_image.size[0]
-                empty_mask = _torch.zeros(1, h, w, device=masks.device)
+                empty_mask = torch.zeros(1, h, w, device=masks.device)
                 empty_segs = ((height, width), [])
                 offload_model_if_needed(sam3_model)
                 return (empty_mask, pil_to_comfy_image(pil_image), "[]", "[]", empty_segs, empty_mask, empty_segs, empty_segs, empty_segs)
@@ -546,9 +545,6 @@ class TBGSam3Segmentation:
 
         # --- Optional: fill holes inside each mask (per-segment, safe) ---
         if fill_holes and isinstance(masks, torch.Tensor) and masks.numel() > 0:
-            import cv2
-            import numpy as np
-
             device = masks.device
 
             # Normalize to [N,H,W] float on CPU
@@ -665,7 +661,6 @@ class TBGSam3Segmentation:
         )
 
         #        # Impact-Pack style combined SEGS from combined mask using masktosegs
-        from .masktosegs import make_2d_mask
 
         combined_label = text_prompt.strip() or "combined"
 
@@ -789,10 +784,6 @@ class TBGSam3Segmentation:
         Returns:
             ( (H, W), [SEG, SEG, ...] )
         """
-        import numpy as np
-        import torch
-        from .masktosegs import make_2d_mask
-
         shape_info = (height, width)
         seg_list = []
 
@@ -1149,7 +1140,6 @@ class TBGSam3SegmentationBatch:
 
             # Fill holes
             if fill_holes and isinstance(masks, torch.Tensor) and masks.numel() > 0:
-                import cv2
                 device = masks.device
                 if masks.dim() == 4 and masks.shape[1] == 1:
                     masks_flat = masks[:, 0, :, :].detach().cpu()
@@ -1259,7 +1249,6 @@ class TBGSam3SegmentationBatch:
         return (final_segs, visualization, combined_mask, batch_masks)
 
     def _build_segs(self, masks, boxes, scores, original_image, text_prompt, width, height, crop_factor):
-        from .masktosegs import make_2d_mask, mask_to_segs
 
         shape_info = (height, width)
         seg_list = []
