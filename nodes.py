@@ -276,8 +276,8 @@ class TBGSam3Segmentation:
             }
         }
 
-    RETURN_TYPES = ("MASK", "IMAGE", "STRING", "STRING", "SEGS", "MASK", "SEGS", "SEGS")
-    RETURN_NAMES = ("masks", "visualization", "boxes", "scores", "segs", "combined_mask", "combined_segs", "overlapping_segs")
+    RETURN_TYPES = ("MASK", "IMAGE", "STRING", "STRING", "SEGS", "MASK", "SEGS", "SEGS", "SEGS")
+    RETURN_NAMES = ("masks", "visualization", "boxes", "scores", "segs", "combined_mask", "combined_segs", "detection_segs", "overlapping_segs")
     FUNCTION = "segment"
     CATEGORY = "TBG/SAM3"
 
@@ -442,7 +442,7 @@ class TBGSam3Segmentation:
                 empty_mask = _torch.zeros(1, h, w, device=masks.device)
                 empty_segs = ((height, width), [])
                 offload_model_if_needed(sam3_model)
-                return (empty_mask, pil_to_comfy_image(pil_image), "[]", "[]", empty_segs, empty_mask, empty_segs)
+                return (empty_mask, pil_to_comfy_image(pil_image), "[]", "[]", empty_segs, empty_mask, empty_segs, empty_segs, empty_segs)
 
         if masks is None or len(masks) == 0:
             print(f"[SAM3] No detections found at threshold {confidence_threshold}")
@@ -450,7 +450,7 @@ class TBGSam3Segmentation:
             empty_mask = torch.zeros(1, h, w)
             empty_segs = ((height, width), [])
             offload_model_if_needed(sam3_model)
-            return (empty_mask, pil_to_comfy_image(pil_image), "[]", "[]", empty_segs, empty_mask, empty_segs)
+            return (empty_mask, pil_to_comfy_image(pil_image), "[]", "[]", empty_segs, empty_mask, empty_segs, empty_segs, empty_segs)
 
         # --- Instance filtering using ONLY user positive prompts ---
         if instances and boxes is not None:
@@ -534,7 +534,7 @@ class TBGSam3Segmentation:
                 empty_mask = torch.zeros(1, h, w, device=boxes.device if boxes is not None else "cpu")
                 empty_segs = ((height, width), [])
                 offload_model_if_needed(sam3_model)
-                return (empty_mask, pil_to_comfy_image(pil_image), "[]", "[]", empty_segs, empty_mask, empty_segs)
+                return (empty_mask, pil_to_comfy_image(pil_image), "[]", "[]", empty_segs, empty_mask, empty_segs, empty_segs, empty_segs)
 
         # --- Limit by max_detections ---
         if actual_max_detections > 0 and len(masks) > actual_max_detections:
@@ -685,41 +685,102 @@ class TBGSam3Segmentation:
             is_contour=True
         )
 
-        # Per-instance SEGS preserving overlaps (combined=True per mask, user crop_factor)
-        overlapping_seg_list = []
-        if isinstance(masks, torch.Tensor) and masks.numel() > 0:
-            masks_cpu_ol = masks.detach().cpu()
-            for i in range(len(masks_cpu_ol)):
-                mask_i = masks_cpu_ol[i]
-                mask_2d = make_2d_mask(mask_i)
+        # Shared CPU copy for detection_segs and overlapping_segs
+        masks_cpu_shared = masks.detach().cpu() if isinstance(masks, torch.Tensor) and masks.numel() > 0 else None
 
+        # detection_segs: 1 SEG per detection, whole mask, no contour splitting
+        detection_seg_list = []
+        if masks_cpu_shared is not None:
+            for i in range(len(masks_cpu_shared)):
+                mask_2d = make_2d_mask(masks_cpu_shared[i])
                 if text_prompt and text_prompt.strip():
-                    olabel = f"{text_prompt}_{i}"
+                    dlabel = f"{text_prompt}_{i}"
                 else:
-                    olabel = f"detection_{i}"
-
+                    dlabel = f"detection_{i}"
                 _, segs_inst = mask_to_segs(
-                    mask_2d,
-                    combined=True,
-                    crop_factor=crop_factor,
-                    bbox_fill=False,
-                    drop_size=1,
-                    label=olabel,
-                    crop_min_size=None,
-                    detailer_hook=None,
-                    is_contour=True,
+                    mask_2d, combined=True, crop_factor=crop_factor,
+                    bbox_fill=False, drop_size=1, label=dlabel,
                 )
                 if segs_inst:
-                    overlapping_seg_list.extend(segs_inst)
+                    detection_seg_list.extend(segs_inst)
+        detection_segs = ((height, width), detection_seg_list)
+
+        # overlapping_segs: merge masks that share pixels, keep non-overlapping separate
+        overlapping_seg_list = []
+        if masks_cpu_shared is not None:
+            n = len(masks_cpu_shared)
+            # Binarize all masks once
+            binary_masks = [(make_2d_mask(masks_cpu_shared[i]) > 0.5) for i in range(n)]
+
+            # Union-Find to group overlapping masks
+            parent = list(range(n))
+
+            def find(x):
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def union(a, b):
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+
+            # Compute bboxes once for fast pre-filtering
+            bboxes_ol = []
+            for bm in binary_masks:
+                rows, cols = np.nonzero(bm)
+                if len(rows) > 0:
+                    bboxes_ol.append((cols.min(), rows.min(), cols.max(), rows.max()))
+                else:
+                    bboxes_ol.append(None)
+
+            # Check pairwise pixel overlap (bbox pre-filter, then pixel check)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if bboxes_ol[i] is None or bboxes_ol[j] is None:
+                        continue
+                    # Quick bbox intersection check
+                    if (bboxes_ol[i][0] <= bboxes_ol[j][2] and bboxes_ol[i][2] >= bboxes_ol[j][0] and
+                            bboxes_ol[i][1] <= bboxes_ol[j][3] and bboxes_ol[i][3] >= bboxes_ol[j][1]):
+                        if np.any(binary_masks[i] & binary_masks[j]):
+                            union(i, j)
+
+            # Group masks by root
+            groups = {}
+            for i in range(n):
+                root = find(i)
+                if root not in groups:
+                    groups[root] = []
+                groups[root].append(i)
+
+            # Merge each group into one mask, create one SEG per group
+            for root, indices in groups.items():
+                merged = binary_masks[indices[0]].astype(np.float32)
+                for idx in indices[1:]:
+                    merged = np.maximum(merged, binary_masks[idx].astype(np.float32))
+
+                if text_prompt and text_prompt.strip():
+                    glabel = f"{text_prompt}_group_{'_'.join(str(i) for i in sorted(indices))}"
+                else:
+                    glabel = f"group_{'_'.join(str(i) for i in sorted(indices))}"
+
+                _, segs_group = mask_to_segs(
+                    merged, combined=True, crop_factor=crop_factor,
+                    bbox_fill=False, drop_size=1, label=glabel,
+                )
+                if segs_group:
+                    overlapping_seg_list.extend(segs_group)
         overlapping_segs = ((height, width), overlapping_seg_list)
 
         print(f"[SAM3] Segmentation complete. {len(comfy_masks)} masks, {len(segs[1])} SEGS, "
               f"combined_segs has {len(combined_segs[1])} elements, "
-              f"overlapping_segs has {len(overlapping_segs[1])} elements.")
+              f"detection_segs has {len(detection_segs[1])} elements, "
+              f"overlapping_segs has {len(overlapping_segs[1])} groups.")
 
         offload_model_if_needed(sam3_model)
 
-        return (comfy_masks, vis_tensor, boxes_json, scores_json, segs, combined_mask, combined_segs, overlapping_segs)
+        return (comfy_masks, vis_tensor, boxes_json, scores_json, segs, combined_mask, combined_segs, detection_segs, overlapping_segs)
 
     def _build_segs(self, masks, boxes, scores, original_image, text_prompt, width, height):
         """
