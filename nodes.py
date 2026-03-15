@@ -3,40 +3,39 @@ ComfyUI SAM3 Nodes, unified model loader for both image and video using official
 All class names and functions prefixed with TBG for uniqueness.
 """
 
+import base64
+import io
+import json
+from typing import Optional, Tuple
+
+import cv2
+import numpy as np
 import torch
 from PIL import Image
-import numpy as np
-import cv2
-
-import json
-import io
-import base64
 
 from sam3_utils import (
-    comfy_image_to_pil,
-    pil_to_comfy_image,
-    masks_to_comfy_mask,
-    visualize_masks_on_image,
-    tensor_to_list,
-    ensure_model_on_device,
-    offload_model_if_needed,
     DepthEstimator,
+    comfy_image_to_pil,
+    ensure_model_on_device,
+    masks_to_comfy_mask,
+    offload_model_if_needed,
+    pil_to_comfy_image,
+    tensor_to_list,
+    visualize_masks_on_image,
 )
 
-from .sam3_lib.model_builder import build_sam3_image_model, build_sam3_video_predictor
-from .sam3_lib.model.sam3_image_processor import Sam3Processor
-from typing import Tuple, Optional
-
-
 # Impact-Pack style MASK -> SEGS helper (your file in same folder)
-from .masktosegs import mask_to_segs, SEG, make_2d_mask
+from .masktosegs import make_2d_mask, mask_to_segs
+from .sam3_lib.model.sam3_image_processor import Sam3Processor
+from .sam3_lib.model_builder import build_sam3_image_model
 
 _MODEL_CACHE = {}
 
 
-from .model_manager import get_available_models, get_model_path, download_sam3_model
-from .sam3_utils import SAM3ImageSegmenter
 import os
+
+from .model_manager import download_sam3_model, get_available_models, get_model_path
+
 try:
     import folder_paths
     base_models_folder = folder_paths.models_dir
@@ -252,6 +251,14 @@ class TBGSam3Segmentation:
                     "display": "slider",
                     "tooltip": "Minimum segment size in pixels as a square side. 1=1x1, 200=200x200; smaller masks are discarded."
                 }),
+                "min_density": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "display": "slider",
+                    "tooltip": "Minimum mask density (foreground pixels / bbox area). 0=disabled, 0.1=at least 10% of bbox must be filled. Filters sparse/feathery masks."
+                }),
                 "fill_holes": ("BOOLEAN", {
                     "default": False,
                     "label_on": "Fill Holes",
@@ -284,7 +291,7 @@ class TBGSam3Segmentation:
 
     def segment(self, sam3_model, image, confidence_threshold=0.2, detect_all=True,
                 pipeline_mode="all", instances=False, crop_factor=1.5, min_size=32,
-                fill_holes=False, text_prompt="", sam3_selectors_pipe=None,
+                min_density=0.0, fill_holes=False, text_prompt="", sam3_selectors_pipe=None,
                 mask_prompt=None, exemplar_box=None, exemplar_mask=None,
                 max_detections=10):
 
@@ -350,7 +357,7 @@ class TBGSam3Segmentation:
         ensure_model_on_device(sam3_model)
         processor = sam3_model["processor"]
 
-        print(f"[SAM3] Running segmentation")
+        print("[SAM3] Running segmentation")
         print(f"[SAM3] Confidence threshold: {confidence_threshold}")
 
         pil_image = comfy_image_to_pil(image)
@@ -437,6 +444,42 @@ class TBGSam3Segmentation:
                 scores = scores[keep_indices] if scores is not None else None
             else:
                 print("[SAM3] All detections removed by min_size filter; returning empty result")
+                h, w = pil_image.size[1], pil_image.size[0]
+                empty_mask = torch.zeros(1, h, w, device=masks.device)
+                empty_segs = ((height, width), [])
+                offload_model_if_needed(sam3_model)
+                return (empty_mask, pil_to_comfy_image(pil_image), "[]", "[]", empty_segs, empty_mask, empty_segs, empty_segs, empty_segs)
+
+        # --- Filter out sparse/feathery masks by density ---
+        if min_density > 0.0 and masks is not None and masks.numel() > 0:
+            if masks.dim() == 4 and masks.shape[1] == 1:
+                masks_flat_d = masks[:, 0, :, :]
+            elif masks.dim() == 3:
+                masks_flat_d = masks
+            else:
+                masks_flat_d = masks.mean(dim=1)
+
+            keep_density = []
+            for i in range(masks_flat_d.shape[0]):
+                ys, xs = torch.where(masks_flat_d[i] > 0.5)
+                if len(ys) == 0:
+                    continue
+                fg = len(ys)
+                bbox_area = (xs.max() - xs.min() + 1).item() * (ys.max() - ys.min() + 1).item()
+                density = fg / bbox_area
+                if density >= min_density:
+                    keep_density.append(i)
+
+            if keep_density:
+                keep_d = torch.tensor(keep_density, dtype=torch.long, device=masks.device)
+                removed = len(masks) - len(keep_density)
+                if removed > 0:
+                    print(f"[SAM3] min_density={min_density:.2f} removed {removed} sparse masks, keeping {len(keep_density)}")
+                masks = masks[keep_d]
+                boxes = boxes[keep_d] if boxes is not None else None
+                scores = scores[keep_d] if scores is not None else None
+            else:
+                print("[SAM3] All detections removed by min_density filter; returning empty result")
                 h, w = pil_image.size[1], pil_image.size[0]
                 empty_mask = torch.zeros(1, h, w, device=masks.device)
                 empty_segs = ((height, width), [])
