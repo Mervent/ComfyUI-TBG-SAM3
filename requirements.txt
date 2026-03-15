@@ -27,3 +27,7 @@ tqdm>=4.65.0
 # Match transformers requirement: >=0.34.0,<1.0 (adjusted to range that exists for your Python)
 # keep transformers itself in a safe range
 transformers>=4.40.0,<5.0.0
+
+# Development tools
+pytest>=9.0
+ruff>=0.15
