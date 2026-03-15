@@ -276,8 +276,8 @@ class TBGSam3Segmentation:
             }
         }
 
-    RETURN_TYPES = ("MASK", "IMAGE", "STRING", "STRING", "SEGS", "MASK", "SEGS")
-    RETURN_NAMES = ("masks", "visualization", "boxes", "scores", "segs", "combined_mask", "combined_segs")
+    RETURN_TYPES = ("MASK", "IMAGE", "STRING", "STRING", "SEGS", "MASK", "SEGS", "SEGS")
+    RETURN_NAMES = ("masks", "visualization", "boxes", "scores", "segs", "combined_mask", "combined_segs", "overlapping_segs")
     FUNCTION = "segment"
     CATEGORY = "TBG/SAM3"
 
@@ -685,12 +685,41 @@ class TBGSam3Segmentation:
             is_contour=True
         )
 
+        # Per-instance SEGS preserving overlaps (combined=True per mask, user crop_factor)
+        overlapping_seg_list = []
+        if isinstance(masks, torch.Tensor) and masks.numel() > 0:
+            masks_cpu_ol = masks.detach().cpu()
+            for i in range(len(masks_cpu_ol)):
+                mask_i = masks_cpu_ol[i]
+                mask_2d = make_2d_mask(mask_i)
 
-        print(f"[SAM3] Segmentation complete. {len(comfy_masks)} masks, {len(segs[1])} SEGS, combined_segs has {len(combined_segs[1])} elements.")
+                if text_prompt and text_prompt.strip():
+                    olabel = f"{text_prompt}_{i}"
+                else:
+                    olabel = f"detection_{i}"
+
+                _, segs_inst = mask_to_segs(
+                    mask_2d,
+                    combined=True,
+                    crop_factor=crop_factor,
+                    bbox_fill=False,
+                    drop_size=1,
+                    label=olabel,
+                    crop_min_size=None,
+                    detailer_hook=None,
+                    is_contour=True,
+                )
+                if segs_inst:
+                    overlapping_seg_list.extend(segs_inst)
+        overlapping_segs = ((height, width), overlapping_seg_list)
+
+        print(f"[SAM3] Segmentation complete. {len(comfy_masks)} masks, {len(segs[1])} SEGS, "
+              f"combined_segs has {len(combined_segs[1])} elements, "
+              f"overlapping_segs has {len(overlapping_segs[1])} elements.")
 
         offload_model_if_needed(sam3_model)
 
-        return (comfy_masks, vis_tensor, boxes_json, scores_json, segs, combined_mask, combined_segs)
+        return (comfy_masks, vis_tensor, boxes_json, scores_json, segs, combined_mask, combined_segs, overlapping_segs)
 
     def _build_segs(self, masks, boxes, scores, original_image, text_prompt, width, height):
         """
