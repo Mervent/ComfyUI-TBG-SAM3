@@ -26,6 +26,8 @@ from sam3_utils import (
 # Impact-Pack style MASK -> SEGS helper (your file in same folder)
 from .lib import mask_filters, mask_ops, prompt_handler
 from .lib import types as lib_types
+from .lib.conditioning_wrapper import ConditioningOverrideWrapper
+from .lib.masktosegs import SEG
 from .lib.segs_builder import (
     build_combined_segs,
     build_contour_segs,
@@ -1134,6 +1136,68 @@ class TBGSAM3DepthMap:
             raise RuntimeError(error_msg)
 
 
+class TBGAttachConditioningToSEGS:
+    """Attach per-SEG positive conditioning via control_net_wrapper.
+
+    Accepts a list of prompt strings (one per SEG) — typically from Florence
+    running once per segment — plus a CLIP model for encoding.
+    Outputs modified SEGS that the Detailer will respect automatically.
+    """
+
+    INPUT_IS_LIST = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "segs": ("SEGS",),
+                "clip": ("CLIP",),
+                "prompt": ("STRING", {"forceInput": True}),
+            },
+        }
+
+    RETURN_TYPES = ("SEGS",)
+    FUNCTION = "doit"
+    CATEGORY = "TBG-SAM3"
+
+    def doit(self, segs, clip, prompt):
+        segs = segs[0]
+        clip = clip[0]
+
+        shape, seg_list = segs
+        new_segs = []
+
+        for i, seg in enumerate(seg_list):
+            if i < len(prompt) and prompt[i].strip():
+                tokens = clip.tokenize(prompt[i])
+                cond, pooled = clip.encode_from_tokens(
+                    tokens,
+                    return_pooled=True,
+                )
+                conditioning = [[cond, {"pooled_output": pooled}]]
+
+                wrapper = ConditioningOverrideWrapper(
+                    conditioning=conditioning,
+                    original_wrapper=seg.control_net_wrapper,
+                )
+
+                new_seg = SEG(
+                    seg.cropped_image,
+                    seg.cropped_mask,
+                    seg.confidence,
+                    seg.crop_region,
+                    seg.bbox,
+                    seg.label,
+                    wrapper,
+                )
+            else:
+                new_seg = seg
+
+            new_segs.append(new_seg)
+
+        return ((shape, new_segs),)
+
+
 NODE_CLASS_MAPPINGS = {
     "TBGLoadSAM3Model": TBGLoadSAM3Model,  # your simple loader
     "TBGSAM3ModelLoaderAdvanced": TBGSAM3ModelLoaderAndDownloader,  # new advanced loader
@@ -1141,6 +1205,7 @@ NODE_CLASS_MAPPINGS = {
     "TBGSam3SegmentationBatch": TBGSam3SegmentationBatch,
     "TBGSAM3PromptCollector": TBGSAM3PromptCollector,
     "TBGSAM3DepthMap": TBGSAM3DepthMap,
+    "TBGAttachConditioningToSEGS": TBGAttachConditioningToSEGS,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1150,4 +1215,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TBGSAM3PromptCollector": "TBG SAM3 Selector",
     "TBGSam3SegmentationBatch": "TBG SAM3 Batch Selector",
     "TBGSAM3DepthMap": "TBG SAM3 Depth Map",
+    "TBGAttachConditioningToSEGS": "TBG Attach Conditioning to SEGS",
 }
