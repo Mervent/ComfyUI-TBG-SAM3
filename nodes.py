@@ -1139,9 +1139,13 @@ class TBGSAM3DepthMap:
 class TBGAttachConditioningToSEGS:
     """Attach per-SEG positive conditioning via control_net_wrapper.
 
-    Accepts a multiline string where each line is a prompt for one SEG
-    (line 0 → SEG 0, line 1 → SEG 1, etc.) plus a CLIP model for encoding.
-    Outputs modified SEGS that the Detailer will respect automatically.
+    Accepts prompts as either:
+    - A multiline string (one line per SEG, manual input)
+    - A list of strings (one per SEG, from Florence2 pipeline via OUTPUT_IS_LIST)
+
+    INPUT_IS_LIST absorbs upstream list cascades (e.g. SEGSPreview →
+    Florence2Run) so this node and the Detailer downstream run once,
+    not once-per-list-item.
     """
 
     @classmethod
@@ -1155,20 +1159,32 @@ class TBGAttachConditioningToSEGS:
             },
         }
 
+    INPUT_IS_LIST = True
     RETURN_TYPES = ("SEGS",)
     FUNCTION = "doit"
     CATEGORY = "TBG-SAM3"
 
     def doit(self, segs, clip, prompt, mode):
-        lines = [line.strip() for line in prompt.split("\n") if line.strip()]
+        # INPUT_IS_LIST wraps every input in a list.
+        # Non-list inputs arrive as [value]; list-cascaded inputs as [v1, v2, …].
+        actual_segs = segs[0]
+        actual_clip = clip[0]
+        actual_mode = mode[0]
 
-        shape, seg_list = segs
+        # prompt is [str1, str2, …] from Florence pipeline,
+        # or ["line1\nline2\n…"] from manual multiline input.
+        if len(prompt) == 1:
+            lines = [l.strip() for l in prompt[0].split("\n") if l.strip()]
+        else:
+            lines = [p.strip() for p in prompt if p.strip()]
+
+        shape, seg_list = actual_segs
         new_segs = []
 
         for i, seg in enumerate(seg_list):
             if i < len(lines):
-                tokens = clip.tokenize(lines[i])
-                cond, pooled = clip.encode_from_tokens(
+                tokens = actual_clip.tokenize(lines[i])
+                cond, pooled = actual_clip.encode_from_tokens(
                     tokens,
                     return_pooled=True,
                 )
@@ -1176,7 +1192,7 @@ class TBGAttachConditioningToSEGS:
 
                 wrapper = ConditioningOverrideWrapper(
                     conditioning=conditioning,
-                    mode=mode,
+                    mode=actual_mode,
                     original_wrapper=seg.control_net_wrapper,
                 )
 
