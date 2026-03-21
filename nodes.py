@@ -1139,12 +1139,10 @@ class TBGSAM3DepthMap:
 class TBGAttachConditioningToSEGS:
     """Attach per-SEG positive conditioning via control_net_wrapper.
 
-    Accepts a list of prompt strings (one per SEG) — typically from Florence
-    running once per segment — plus a CLIP model for encoding.
+    Accepts a multiline string where each line is a prompt for one SEG
+    (line 0 → SEG 0, line 1 → SEG 1, etc.) plus a CLIP model for encoding.
     Outputs modified SEGS that the Detailer will respect automatically.
     """
-
-    INPUT_IS_LIST = True
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1152,7 +1150,7 @@ class TBGAttachConditioningToSEGS:
             "required": {
                 "segs": ("SEGS",),
                 "clip": ("CLIP",),
-                "prompt": ("STRING", {"forceInput": True}),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": False}),
             },
         }
 
@@ -1161,15 +1159,14 @@ class TBGAttachConditioningToSEGS:
     CATEGORY = "TBG-SAM3"
 
     def doit(self, segs, clip, prompt):
-        segs = segs[0]
-        clip = clip[0]
+        lines = [line.strip() for line in prompt.split("\n") if line.strip()]
 
         shape, seg_list = segs
         new_segs = []
 
         for i, seg in enumerate(seg_list):
-            if i < len(prompt) and prompt[i].strip():
-                tokens = clip.tokenize(prompt[i])
+            if i < len(lines):
+                tokens = clip.tokenize(lines[i])
                 cond, pooled = clip.encode_from_tokens(
                     tokens,
                     return_pooled=True,
