@@ -33,61 +33,67 @@ def hash_seed(seed: int) -> int:
     return int(hashlib.sha256(seed_bytes).hexdigest(), 16) % (2**32)
 
 
-def crop_and_mask_seg_image(
+def crop_seg_bbox(
     image: torch.Tensor,
-    crop_region: tuple[int, int, int, int],
-    cropped_mask: np.ndarray | torch.Tensor,
+    bbox: tuple[int, int, int, int],
 ) -> Image.Image:
-    """Crop original image to *crop_region*, mask out non-segment pixels.
+    """Crop original image to a SEG's tight bounding box.
 
     Parameters
     ----------
     image:
         Full image tensor ``[B, H, W, C]`` or ``[H, W, C]``, float32 0-1.
-    crop_region:
-        ``(x1, y1, x2, y2)`` pixel coordinates (same space as the full image).
-    cropped_mask:
-        2-D mask aligned to *crop_region*, values in 0-1.
-        Shape ``[crop_h, crop_w]`` or broadcastable.
+    bbox:
+        ``(x1, y1, x2, y2)`` pixel coordinates of the detection box.
 
     Returns
     -------
     PIL.Image.Image
-        RGB crop with non-segment pixels set to black.
+        RGB crop of the bbox region — natural image pixels, no masking.
     """
     if image.ndim == 4:
         image = image[0]  # take first batch element
 
-    x1, y1, x2, y2 = crop_region
-    crop = image[y1:y2, x1:x2, :]  # [crop_h, crop_w, C]
+    x1, y1, x2, y2 = bbox
+    crop = image[y1:y2, x1:x2, :]  # [h, w, C]
+    crop_uint8 = (
+        (crop.detach().cpu().float().numpy() * 255).clip(0, 255).astype(np.uint8)
+    )
+    return Image.fromarray(crop_uint8, mode="RGB")
 
-    # Ensure mask is a numpy array, float32, 2-D
-    if isinstance(cropped_mask, torch.Tensor):
-        mask_np = cropped_mask.detach().cpu().float().numpy()
-    else:
-        mask_np = np.asarray(cropped_mask, dtype=np.float32)
 
-    if mask_np.ndim == 3:
-        mask_np = mask_np.squeeze(0) if mask_np.shape[0] == 1 else mask_np[:, :, 0]
+def bbox_crops_to_tensor(pil_images: list[Image.Image]) -> torch.Tensor:
+    """Stack variable-size PIL crops into a ComfyUI IMAGE batch.
 
-    crop_np = crop.detach().cpu().float().numpy()  # [crop_h, crop_w, C], 0-1
+    All crops are resized to the largest width/height in the batch so
+    they can be stacked into a single ``[N, H, W, C]`` tensor.
+    Aspect ratio is preserved by padding with black.
 
-    # Resize mask to match crop if dimensions differ (safety net)
-    ch, cw = crop_np.shape[:2]
-    mh, mw = mask_np.shape[:2]
-    if (mh, mw) != (ch, cw):
-        from PIL import Image as _PILImage
+    Parameters
+    ----------
+    pil_images:
+        List of PIL RGB images (bbox crops, may differ in size).
 
-        mask_pil = _PILImage.fromarray((mask_np * 255).astype(np.uint8), mode="L")
-        mask_pil = mask_pil.resize((cw, ch), _PILImage.Resampling.BILINEAR)
-        mask_np = np.asarray(mask_pil, dtype=np.float32) / 255.0
+    Returns
+    -------
+    torch.Tensor
+        ``[N, max_H, max_W, 3]`` float32 0-1.
+    """
+    if not pil_images:
+        return torch.zeros((1, 64, 64, 3), dtype=torch.float32)
 
-    # Apply mask: object pixels only, black elsewhere
-    masked = crop_np * mask_np[:, :, np.newaxis]
+    max_h = max(img.height for img in pil_images)
+    max_w = max(img.width for img in pil_images)
 
-    # Convert to uint8 PIL
-    masked_uint8 = (np.clip(masked, 0.0, 1.0) * 255).astype(np.uint8)
-    return Image.fromarray(masked_uint8, mode="RGB")
+    tensors: list[torch.Tensor] = []
+    for img in pil_images:
+        # Paste onto black canvas at top-left
+        canvas = Image.new("RGB", (max_w, max_h), (0, 0, 0))
+        canvas.paste(img, (0, 0))
+        arr = np.asarray(canvas, dtype=np.float32) / 255.0
+        tensors.append(torch.from_numpy(arr))
+
+    return torch.stack(tensors, dim=0)  # [N, H, W, C]
 
 
 def caption_image(
