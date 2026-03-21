@@ -1159,6 +1159,12 @@ class TBGAttachConditioningToSEGS:
     CATEGORY = "TBG-SAM3"
 
     def doit(self, segs, clip, prompt):
+        print(
+            f"[TBG-SEGS] Input type: {type(segs)}, shape: {segs[0] if segs else 'empty'}"
+        )
+        print(f"[TBG-SEGS] Seg count: {len(segs[1]) if len(segs) > 1 else 0}")
+        print(f"[TBG-SEGS] Prompt: {repr(prompt)}")
+
         lines = [line.strip() for line in prompt.split("\n") if line.strip()]
 
         shape, seg_list = segs
@@ -1192,6 +1198,7 @@ class TBGAttachConditioningToSEGS:
 
             new_segs.append(new_seg)
 
+        print(f"[TBG-SEGS] Output: {len(new_segs)} segs, shape: {shape}")
         return ((shape, new_segs),)
 
 
