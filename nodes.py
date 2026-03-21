@@ -29,9 +29,10 @@ from .lib import types as lib_types
 from .lib.conditioning_wrapper import ConditioningOverrideWrapper
 from .lib.florence2_captioner import (
     TASK_LIST,
+    bbox_crops_to_tensor,
     build_caption,
     caption_image,
-    crop_and_mask_seg_image,
+    crop_seg_bbox,
 )
 from .lib.masktosegs import SEG
 from .lib.segs_builder import (
@@ -1262,8 +1263,8 @@ class TBGFlorence2SEGSCaptioner:
             },
         }
 
-    RETURN_TYPES = ("SEGS", "STRING")
-    RETURN_NAMES = ("segs", "captions")
+    RETURN_TYPES = ("SEGS", "STRING", "IMAGE")
+    RETURN_NAMES = ("segs", "captions", "bbox_preview")
     FUNCTION = "doit"
     CATEGORY = "TBG-SAM3"
 
@@ -1288,31 +1289,30 @@ class TBGFlorence2SEGSCaptioner:
         shape, seg_list = segs
 
         if not seg_list:
-            return ((shape, []), "")
+            empty_img = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            return ((shape, []), "", empty_img)
 
         # --- Device management (matches kijai's Florence2Run pattern) ---
-        model = florence2_model["model"]
+        fl2_model = florence2_model["model"]
         processor = florence2_model["processor"]
         dtype = florence2_model["dtype"]
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
-        model.to(device)
+        fl2_model.to(device)
 
         new_segs: list = []
         captions: list[str] = []
+        bbox_crops: list = []
 
         try:
             for seg in seg_list:
-                # --- Crop + mask the original image for this SEG ---
-                pil_crop = crop_and_mask_seg_image(
-                    image=image,
-                    crop_region=seg.crop_region,
-                    cropped_mask=seg.cropped_mask,
-                )
+                # --- Crop original image to tight bbox ---
+                pil_crop = crop_seg_bbox(image=image, bbox=seg.bbox)
+                bbox_crops.append(pil_crop)
 
                 # --- Florence2 captioning ---
                 generated = caption_image(
-                    model=model,
+                    model=fl2_model,
                     processor=processor,
                     dtype=dtype,
                     pil_image=pil_crop,
@@ -1361,11 +1361,12 @@ class TBGFlorence2SEGSCaptioner:
         finally:
             # --- Offload Florence2 model ---
             if not keep_model_loaded:
-                model.to(offload_device)
+                fl2_model.to(offload_device)
                 mm.soft_empty_cache()
 
         all_captions = "\n".join(captions)
-        return ((shape, new_segs), all_captions)
+        preview_tensor = bbox_crops_to_tensor(bbox_crops)
+        return ((shape, new_segs), all_captions, preview_tensor)
 
 
 NODE_CLASS_MAPPINGS = {
