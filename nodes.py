@@ -27,6 +27,12 @@ from sam3_utils import (
 from .lib import mask_filters, mask_ops, prompt_handler
 from .lib import types as lib_types
 from .lib.conditioning_wrapper import ConditioningOverrideWrapper
+from .lib.florence2_captioner import (
+    TASK_LIST,
+    build_caption,
+    caption_image,
+    crop_and_mask_seg_image,
+)
 from .lib.masktosegs import SEG
 from .lib.segs_builder import (
     build_combined_segs,
@@ -1213,6 +1219,155 @@ class TBGAttachConditioningToSEGS:
         return ((shape, new_segs),)
 
 
+class TBGFlorence2SEGSCaptioner:
+    """Caption each SEG with Florence2, CLIP-encode, and bake conditioning in.
+
+    Replaces the multi-node chain:
+        SEGSPreview → Florence2Run → StringListToString → AttachConditioning
+
+    For each SEG the node crops the original image to the SEG's region,
+    masks out non-segment pixels (so Florence2 sees only the object),
+    generates a caption, optionally combines it with a user prompt,
+    CLIP-encodes the result, and attaches it as per-SEG conditioning
+    via ``control_net_wrapper``.
+
+    Requires kijai's ComfyUI-Florence2 extension for the FL2MODEL type.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "segs": ("SEGS",),
+                "florence2_model": ("FL2MODEL",),
+                "clip": ("CLIP",),
+                "task": (TASK_LIST, {"default": "caption"}),
+                "prompt_mode": (
+                    ["prepend", "append", "generated only", "user only"],
+                    {"default": "prepend"},
+                ),
+                "conditioning_mode": (["replace", "concat"],),
+            },
+            "optional": {
+                "text_input": (
+                    "STRING",
+                    {"default": "", "multiline": True, "dynamicPrompts": False},
+                ),
+                "keep_model_loaded": ("BOOLEAN", {"default": False}),
+                "max_new_tokens": ("INT", {"default": 1024, "min": 1, "max": 4096}),
+                "num_beams": ("INT", {"default": 3, "min": 1, "max": 64}),
+                "do_sample": ("BOOLEAN", {"default": True}),
+                "seed": ("INT", {"default": 1, "min": 1, "max": 0xFFFFFFFFFFFFFFFF}),
+            },
+        }
+
+    RETURN_TYPES = ("SEGS", "STRING")
+    RETURN_NAMES = ("segs", "captions")
+    FUNCTION = "doit"
+    CATEGORY = "TBG-SAM3"
+
+    def doit(
+        self,
+        image,
+        segs,
+        florence2_model,
+        clip,
+        task,
+        prompt_mode,
+        conditioning_mode,
+        text_input="",
+        keep_model_loaded=False,
+        max_new_tokens=1024,
+        num_beams=3,
+        do_sample=True,
+        seed=None,
+    ):
+        import comfy.model_management as mm
+
+        shape, seg_list = segs
+
+        if not seg_list:
+            return ((shape, []), "")
+
+        # --- Device management (matches kijai's Florence2Run pattern) ---
+        model = florence2_model["model"]
+        processor = florence2_model["processor"]
+        dtype = florence2_model["dtype"]
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        model.to(device)
+
+        new_segs: list = []
+        captions: list[str] = []
+
+        try:
+            for seg in seg_list:
+                # --- Crop + mask the original image for this SEG ---
+                pil_crop = crop_and_mask_seg_image(
+                    image=image,
+                    crop_region=seg.crop_region,
+                    cropped_mask=seg.cropped_mask,
+                )
+
+                # --- Florence2 captioning ---
+                generated = caption_image(
+                    model=model,
+                    processor=processor,
+                    dtype=dtype,
+                    pil_image=pil_crop,
+                    task=task,
+                    device=device,
+                    max_new_tokens=max_new_tokens,
+                    num_beams=num_beams,
+                    do_sample=do_sample,
+                    seed=seed,
+                )
+
+                # --- Combine with user prompt ---
+                final_prompt = build_caption(
+                    generated=generated,
+                    user_prompt=text_input,
+                    prompt_mode=prompt_mode,
+                )
+                captions.append(final_prompt)
+
+                # --- CLIP encode → conditioning ---
+                tokens = clip.tokenize(final_prompt)
+                cond, pooled = clip.encode_from_tokens(
+                    tokens,
+                    return_pooled=True,
+                )
+                conditioning = [[cond, {"pooled_output": pooled}]]
+
+                # --- Wrap and attach to SEG ---
+                wrapper = ConditioningOverrideWrapper(
+                    conditioning=conditioning,
+                    mode=conditioning_mode,
+                    original_wrapper=seg.control_net_wrapper,
+                )
+
+                new_segs.append(
+                    SEG(
+                        seg.cropped_image,
+                        seg.cropped_mask,
+                        seg.confidence,
+                        seg.crop_region,
+                        seg.bbox,
+                        seg.label,
+                        wrapper,
+                    )
+                )
+        finally:
+            # --- Offload Florence2 model ---
+            if not keep_model_loaded:
+                model.to(offload_device)
+                mm.soft_empty_cache()
+
+        all_captions = "\n".join(captions)
+        return ((shape, new_segs), all_captions)
+
+
 NODE_CLASS_MAPPINGS = {
     "TBGLoadSAM3Model": TBGLoadSAM3Model,  # your simple loader
     "TBGSAM3ModelLoaderAdvanced": TBGSAM3ModelLoaderAndDownloader,  # new advanced loader
@@ -1221,6 +1376,7 @@ NODE_CLASS_MAPPINGS = {
     "TBGSAM3PromptCollector": TBGSAM3PromptCollector,
     "TBGSAM3DepthMap": TBGSAM3DepthMap,
     "TBGAttachConditioningToSEGS": TBGAttachConditioningToSEGS,
+    "TBGFlorence2SEGSCaptioner": TBGFlorence2SEGSCaptioner,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1231,4 +1387,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TBGSam3SegmentationBatch": "TBG SAM3 Batch Selector",
     "TBGSAM3DepthMap": "TBG SAM3 Depth Map",
     "TBGAttachConditioningToSEGS": "TBG Attach Conditioning to SEGS",
+    "TBGFlorence2SEGSCaptioner": "TBG Florence2 SEGS Captioner",
 }
